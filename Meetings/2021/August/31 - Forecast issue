@@ -1,0 +1,496 @@
+WITH REP_PROJECT_REVENUE_SOLD_FORECAST AS (
+    -- 'project_level_sold_project_revenue' roll up actuals, forecasted and tm_sold_project_rev to the project-level
+    -- note: forecasted_project_hours should only be considered for FUTURE months
+    WITH VIEW_FROM_EMPL_SOLD_FORECAST AS (
+        WITH project_managers AS (
+                -- due to having multiple managers on the same project code for the same year-month, we are using array of managers
+            WITH manager_array AS (
+                SELECT DISTINCT project_start_date
+                                , project_end_date
+                                , project_code
+                                , employee_name
+                FROM TOMW_DB.OVERWATCH_DEV_marts.rep_employee_revenue_sold_forecast
+                WHERE is_project_manager = TRUE
+            )
+            SELECT DISTINCT project_start_date
+                            , project_end_date
+                            , project_code
+                            , ARRAY_TO_STRING(
+                                array_agg(manager_array.employee_name)
+                                    WITHIN GROUP (ORDER BY employee_name)
+                                    OVER ( PARTITION BY project_start_date, project_end_date , project_code ),', '
+                            ) AS project_manager
+            FROM manager_array
+    )
+    SELECT  emp_sold_forecast.project_code
+            , project_region
+            , project_domain
+            , client_name
+            , project_name
+            , assignment_month
+            , assignment_month_num
+            , assignment_year
+            , emp_sold_forecast.project_start_date
+            , emp_sold_forecast.project_end_date
+            , emp_sold_forecast.is_project_archived
+            , assignment_status
+            , sf_stage
+            , is_fixed_priced
+            , is_project_billable
+            , project_sow_value
+            , project_managers.project_manager              AS project_manager
+            , SUM(actual_hours)                             AS actual_project_hours_per_month
+            /* forecasted_hours is considered for any months with values for forecasted hours */
+            , SUM(forecasted_hours)                         AS forecasted_project_hours_per_month
+            , SUM(employee_sold_project_revenue)            AS tm_sold_project_revenue_per_month
+    FROM    TOMW_DB.OVERWATCH_DEV_marts.rep_employee_revenue_sold_forecast AS emp_sold_forecast
+    LEFT JOIN project_managers
+    ON emp_sold_forecast.project_start_date = project_managers.project_start_date
+        AND emp_sold_forecast.project_end_date = project_managers.project_end_date
+        AND emp_sold_forecast.project_code = project_managers.project_code
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
+    )
+, ACTUALS_REVENUE AS (
+    SELECT  
+        "YEAR",
+        "MONTH",
+        UPPER(NULLIF (TRIM(PROJECTCODE),''))    AS PROJECTCODE,
+        SUM(actualrevenue) AS actualrevenue
+    FROM TOMW_DB.OVERWATCH_DEV_marts.transient_dim_actual_revenue_by_project
+    WHERE NULLIF(TRIM(PROJECTCODE),'') IS NOT NULL
+    GROUP BY 1,2,3
+    )
+, LATEST_ACTUAL_MONTH AS (
+    SELECT DATE 
+    FROM (
+    SELECT DISTINCT MAX(CASE WHEN "CR Type" ='ACTUALS' THEN ACTUALS_TRACKER."DATE"::DATE ELSE NULL END) OVER (PARTITION BY "CR Type") AS DATE
+    FROM TOMW_DB.OVERWATCH_DEV_stg.actuals_tracker
+    )
+    WHERE DATE IS NOT NULL
+)
+, ACTUAL_FORECAST_LABEL_AND_REVENUE AS (
+        SELECT  
+            sold_forecast.*,
+            (TO_DATE(CAST(sold_forecast.assignment_year as VARCHAR) || '-' || CAST(sold_forecast.assignment_month_num as VARCHAR) || '-01')) as assignmnt_date,
+            (CASE 
+                WHEN TO_DATE(CAST(sold_forecast.assignment_year as VARCHAR) || '-' || CAST(sold_forecast.assignment_month_num as VARCHAR) || '-01') <= LATEST_ACTUAL_MONTH.DATE 
+                THEN 'ACTUALS' 
+                ELSE 'FORECAST' END
+                ) AS  FORECAST_LABEL,
+                (ACTUALS_REVENUE.actualrevenue) 
+        FROM  VIEW_FROM_EMPL_SOLD_FORECAST   AS sold_forecast
+        INNER JOIN LATEST_ACTUAL_MONTH ON 1=1
+        LEFT JOIN ACTUALS_REVENUE
+                ON  ACTUALS_REVENUE."YEAR"      =   sold_forecast.assignment_year
+                AND ACTUALS_REVENUE."MONTH"     =   sold_forecast.assignment_month_num 
+                AND ACTUALS_REVENUE.PROJECTCODE =   sold_forecast.project_code
+        )
+, FINAL_V AS (
+    SELECT *,
+        SUM(CASE WHEN FORECAST_LABEL='ACTUALS' THEN  ZEROIFNULL(actualrevenue) ELSE 0 END) 
+            OVER (PARTITION BY PROJECT_CODE)                                            AS TOTAL_ACTUAL_REVENUE_OF_PROJECT,
+        SUM(CASE WHEN FORECAST_LABEL='FORECAST' THEN  ZEROIFNULL(forecasted_project_hours_per_month) ELSE 0 END) 
+            OVER (PARTITION BY PROJECT_CODE)                                            AS FORECAST_HRS_REMAINING,
+        (ZEROIFNULL(project_sow_value) - TOTAL_ACTUAL_REVENUE_OF_PROJECT)               AS SOW_REMAINING,
+        (forecasted_project_hours_per_month / NULLIF(FORECAST_HRS_REMAINING,0) * NULLIF(SOW_REMAINING,0) )  AS FP_REVENUE,
+        (CASE 
+            WHEN is_fixed_priced
+            THEN (CASE WHEN FORECAST_LABEL='ACTUALS' THEN  ZEROIFNULL(actualrevenue) ELSE ZEROIFNULL(FP_REVENUE) END)
+            ELSE (CASE WHEN FORECAST_LABEL='ACTUALS' THEN  ZEROIFNULL(actualrevenue) ELSE ZEROIFNULL(tm_sold_project_revenue_per_month) END)
+            END 
+        ) AS sold_project_revenue
+    FROM ACTUAL_FORECAST_LABEL_AND_REVENUE
+    )
+    SELECT 
+        project_code
+        , project_region            AS REGION
+        , project_domain            AS DOMAIN
+        , client_name               AS "Client Name"
+        , project_name              AS "Project Description"
+        , assignment_month_num      AS month_num
+        , assignment_year           AS YEAR
+        , assignment_status
+        , project_start_date        AS "Start Date"
+        , project_end_date          AS "End Date"
+        , CASE 
+            WHEN    is_project_archived
+            THEN    'CLOSED'
+            ELSE    'OPEN'
+            END  AS project_condition
+        , sf_stage
+        , is_fixed_priced
+        , is_project_billable
+        , project_manager
+        , assignmnt_date
+        , actual_project_hours_per_month
+        , tm_sold_project_revenue_per_month
+        , forecasted_project_hours_per_month
+        , actualrevenue
+        , project_sow_value         AS "SOW Value"
+        , sold_project_revenue
+ -- new-fields
+        , FORECAST_LABEL 
+        , FORECAST_HRS_REMAINING
+        , SOW_REMAINING
+        , FP_REVENUE
+        , TOTAL_ACTUAL_REVENUE_OF_PROJECT
+    FROM FINAL_V
+  -- HEREHEREHERE  
+  -- WHERE sold_project_revenue <> 0
+)
+
+SELECT sold_project_revenue, MONTH_NUM as month, tm_sold_project_revenue_per_month, * FROM REP_PROJECT_REVENUE_SOLD_FORECAST
+WHERE PROJECT_CODE = 'DHP-21.012.API-TM-BRI'
+ORDER BY MONTH_NUM
+;
+
+
+
+SELECT  emp_sold_forecast.project_code
+        , project_region
+        , project_domain
+        , client_name
+        , project_name
+        , assignment_month
+        , assignment_month_num
+        , assignment_year
+        , emp_sold_forecast.project_start_date
+        , emp_sold_forecast.project_end_date
+        , emp_sold_forecast.is_project_archived
+        , assignment_status
+        , sf_stage
+        , is_fixed_priced
+        , is_project_billable
+        , project_sow_value
+        -- , project_managers.project_manager              AS project_manager
+        , (actual_hours)                             AS actual_project_hours_per_month
+        /* forecasted_hours is considered for any months with values for forecasted hours */
+        , (forecasted_hours)                         AS forecasted_project_hours_per_month
+        , (employee_sold_project_revenue)            AS tm_sold_project_revenue_per_month    -- <-------------------------------- employee_sold_project_revenue
+FROM    TOMW_DB.OVERWATCH_DEV_marts.rep_employee_revenue_sold_forecast AS emp_sold_forecast
+WHERE PROJECT_CODE = 'DHP-21.012.API-TM-BRI'
+AND assignment_month_num = 9;
+
+
+WITH REP_EMPLOYEE_REVENUE_SOLD_FORECAST AS (
+    SELECT  harvest_project_id
+            , forecast_project_id
+            , project_code
+            , employee_id
+            , client_name
+            , project_name
+            , employee_name
+            , project_region
+            , project_domain
+            , assignment_month
+            , assignment_month_num
+            , assignment_date
+            , assignment_year
+            , project_start_date
+            , project_end_date
+            , assignment_status
+            , sf_stage
+            , is_fixed_priced
+            , is_employee_billable
+            , is_project_billable
+            , is_employee_active_on_project
+            , is_project_manager
+            , is_project_archived
+            , is_admin
+            , project_sow_value
+            , harvest_billable_rate
+            , SUM(IFF(forecast_or_actuals = 'forecast_hours', hours, 0)) AS forecasted_hours
+            , SUM(IFF(forecast_or_actuals = 'actual_hours', hours, 0))   AS actual_hours
+            , CASE
+                WHEN is_fixed_priced = 'FALSE' THEN forecasted_hours * harvest_billable_rate * 0.95  -- < --------------------------------------------
+              END                               AS employee_sold_project_revenue
+    FROM    TOMW_DB.OVERWATCH_DEV_marts.fact_forecast_and_actuals_daily as fact_forecast_and_actuals_daily
+    WHERE   YEAR(assignment_date) >= YEAR(CURRENT_DATE())-1
+        AND     is_project_billable = 'TRUE'    --remove non-billable projects
+        AND     is_billable = 'TRUE'   --remove non-billable time entries, and forecast non-billable projects
+    GROUP BY  harvest_project_id, forecast_project_id, project_code, employee_id, employee_name, project_region, project_domain, client_name, project_name, assignment_month, assignment_month_num, assignment_year, project_start_date, project_end_date, assignment_status, sf_stage, is_fixed_priced, is_employee_billable, is_project_billable, is_employee_active_on_project, is_project_manager, is_project_archived, is_admin, project_sow_value, harvest_billable_rate, ASSIGNMENT_DATE
+    --ORDER BY client_name, project_name, employee_name
+)
+
+SELECT * FROM REP_EMPLOYEE_REVENUE_SOLD_FORECAST
+WHERE PROJECT_CODE = 'DHP-21.012.API-TM-BRI'
+AND assignment_month_num = 9;
+
+
+
+WITH FACT_FORECAST_AND_ACTUALS_DAILY AS (
+    -- harvest_time_entries is just a subset of employee actual_hours from the previous year
+    WITH harvest_time_entries AS (
+        SELECT  harvest_user_id
+                , harvest_project_id
+                , client_name
+                , project_code
+                , project_name
+                , employee_name
+                , billable
+                , billable_rate
+                , assignment_date
+                , YEAR(assignment_date) AS assignment_date_year
+                , SUM(actual_hours)     AS actual_hours
+        FROM TOMW_DB.OVERWATCH_DEV_marts.dim_people_time_entries
+        WHERE assignment_date_year >= year(current_date()) - 1
+        --data from this FY is only required. AS such, retrieving year(current_date()) - 1 will retrieve a little bit more than this FY */
+        GROUP BY harvest_user_id, harvest_project_id, client_name, project_code, project_name, employee_name, assignment_date, assignment_date_year, billable_rate, billable
+    )
+    /*  actuals are included until the final day of the prior month.
+        On the 1st of each month, the prior month will be sourced from 'actuals'.
+        See WHERE condition in actuals below */
+    , actuals AS (
+        SELECT  harvest_te.harvest_project_id
+                , project.forecast_project_id
+                , harvest_te.project_code
+                , people.payroll_id             AS employee_id
+                , client_name
+                , project_name
+                , employee_name
+                , IFF(region_lookup.project_code IS NOT NULL, region_lookup.region, project.region) AS project_region
+                , project.domain                AS project_domain
+                , assignment_date -- used to fetch data at the daily grain
+                , monthname(assignment_date)    AS assignment_month
+                , month(assignment_date)        AS assignment_month_num
+                , year(assignment_date)         AS assignment_year
+                , project.forecast_start_date   AS project_start_date
+                , project.forecast_end_date     AS project_end_date
+                , project.forecast_status       AS assignment_status
+                , project.sf_stage
+                , project.is_fixed_fee          AS is_fixed_priced
+                , people.billable               AS is_employee_billable
+                , project.billable              AS is_project_billable
+                -- 'is_employee_active_on_project' is from forecast assignments, therefore is NULL here
+                , NULL                          AS is_employee_active_on_project
+                -- 'is_project_manager' will be NULL because it is from forecast assignments
+                , NULL                          AS is_project_manager
+                , project.archived              AS is_project_archived
+                , people.is_admin
+                , project.cost_budget           AS project_sow_value
+                , harvest_te.billable_rate      AS harvest_billable_rate 
+                , harvest_te.actual_hours       AS hours
+                , harvest_te.billable           AS is_billable
+                , 'actual_hours'                AS forecast_or_actuals
+        FROM    harvest_time_entries              AS harvest_te
+        LEFT JOIN TOMW_DB.OVERWATCH_DEV_marts.dim_project                    AS project 
+        ON project.harvest_project_id = harvest_te.harvest_project_id
+        LEFT JOIN TOMW_DB.OVERWATCH_DEV_marts.dim_people                     AS people 
+        ON people.harvest_user_id = harvest_te.harvest_user_id
+        LEFT JOIN TOMW_DB.OVERWATCH_DEV_stg.project_code_region_lookup  AS region_lookup 
+        ON region_lookup.project_code = harvest_te.project_code
+        -- get all hours for actuals up till the end of the prior month
+        WHERE   assignment_date <= ADD_MONTHS(LAST_DAY(CURRENT_DATE()), -1)
+            -- only bring in billable and signed (SOLD) projects through
+            AND billable_rate IS NOT NULL
+            AND project.sf_stage = 'SOLD'
+    )
+    , forecast AS (
+      
+      ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        SELECT  forecast_assignments.harvest_project_id
+                , project.forecast_project_id
+                , forecast_assignments.project_code
+                , people.payroll_id                                 AS employee_id
+                , client_name
+                , project_name
+                , employee_name
+                , IFF(region_lookup.project_code IS NOT NULL, region_lookup.region, project.region) AS project_region
+                , project.domain                                    AS project_domain
+                , assignment_date -- used to fetch data at the daily grain
+                , monthname(assignment_date)                        AS assignment_month
+                , month(assignment_date)                            AS assignment_month_num
+                , year(assignment_date)                             AS assignment_year
+                , project.forecast_start_date                       AS project_start_date
+                , project.forecast_end_date                         AS project_end_date
+                , forecast_assignments.assignment_status
+                , forecast_assignments.sf_stage
+                , project.is_fixed_fee                              AS is_fixed_priced
+                , people.billable                                   AS is_employee_billable
+                , project.billable                                  AS is_project_billable
+                -- 'is_employee_active_on_project' is from forecast assignments, therefore is NULL here
+                , NULL                                              AS is_employee_active_on_project
+                , is_project_manager
+                , project.archived                                  AS is_project_archived
+                , people.is_admin
+                , project.cost_budget                               AS project_sow_value
+                , forecast_assignments.harvest_billable_rate                          -- <---------------------------------------------------------------
+                , forecast_assignments.assignment_forecasted_hours  AS hours
+                , forecast_assignments.is_project_billable          AS is_billable
+                , 'forecast_hours'                                  AS forecast_or_actuals
+        FROM    TOMW_DB.OVERWATCH_DEV_marts.fact_forecast_assignments_daily     AS forecast_assignments
+        LEFT JOIN  TOMW_DB.OVERWATCH_DEV_marts.dim_project                      AS project
+        ON project.harvest_project_id = forecast_assignments.harvest_project_id
+        LEFT JOIN  TOMW_DB.OVERWATCH_DEV_marts.dim_people                       AS people
+        ON people.harvest_user_id = forecast_assignments.harvest_user_id
+        --region lookup fetches any 'region overrides' requested by the finance team
+        LEFT JOIN TOMW_DB.OVERWATCH_DEV_stg.project_code_region_lookup  AS region_lookup
+        ON region_lookup.project_code = forecast_assignments.project_code
+        -- get forecast hours for the first of the current month into the future
+        WHERE IS_PROJECT_BILLABLE = true
+            -- only bring in billable and signed (SOLD) projects through
+        AND forecast_assignments.sf_stage = 'SOLD'
+        AND forecast_assignments.project_code = 'DHP-21.012.API-TM-BRI'
+        AND assignment_month_num = 9
+      -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    )
+    -- union together the actuals and the forecasted views
+    SELECT * from actuals
+    UNION
+    SELECT * from forecast
+    --ORDER BY assignment_date, employee_name
+)
+
+SELECT harvest_billable_rate, * FROM FACT_FORECAST_AND_ACTUALS_DAILY
+WHERE PROJECT_CODE = 'DHP-21.012.API-TM-BRI'
+AND assignment_month_num = 9;
+
+
+
+
+-- HARVEST_PROJECT_ID = 28063606
+-- FORECAST_PROJECT_ID = 2984265
+
+
+
+
+WITH FACT_FORECAST_ASSIGNMENTS_DAILY AS (
+    SELECT  people_project_assignments.harvest_user_id
+            , people_project_assignments.forecast_people_id
+            , project.harvest_project_id
+            , people_project_assignments.forecast_project_id
+            , people_calendar.forecast_people_id                                        AS employee_id
+            , project.client_id                                                         AS project_client_id
+            , project.forecast_project_code                                             AS project_code
+            , people_calendar.full_name                                                 AS employee_name
+            , people_calendar.date                                                      AS assignment_date
+            , MONTHNAME(people_calendar.date)                                           AS assignment_month
+            , MONTH(people_calendar.date)                                               AS assignment_month_num
+            , YEAR(people_calendar.date)                                                AS assignment_year
+            , people_project_assignments.assignment_start_date
+            , people_project_assignments.assignment_end_date
+            , forecast_status                                                           AS assignment_status
+            , sf_stage
+            /* only determine forecasted_hours when forecast_status isn't null.
+               Also 'allocation' is captured by the minute.
+               E.g. when allocation = 28800 (this is common), this means 8 hours:
+               28800 / 60 / 60 = 8 hours */
+            , CASE
+                WHEN project.forecast_status IS NULL THEN 0
+                ELSE COALESCE(people_project_assignments.allocation / 60 / 60 :: DOUBLE PRECISION, 0)
+              END                                                                       AS assignment_forecasted_hours
+            , people_project_assignments.harvest_billable_rate  --<------------------------------------------------------
+            , people_project_assignments.is_project_manager
+            , people_project_assignments.is_employee_active_on_project
+            , people_project_assignments.is_admin
+            --project_region isn't always populated. If it isn't, use the region from the employee
+            , CASE
+                WHEN project.region IS NULL THEN people_project_assignments.region
+                ELSE project.region
+              END                                                                       AS project_region
+            , project.city                                                              AS project_city
+            , project.domain                                                            AS project_domain
+            , project.manager                                                           AS project_manager
+            , project.harvest_client                                                    AS client_name
+            , project.harvest_project_name                                              AS project_name
+            , project.region IS NOT NULL                                                AS is_using_project_region
+            , project.forecast_start_date :: DATE                                       AS project_start_date
+            , project.forecast_end_date :: DATE                                         AS project_end_date
+            , people_project_assignments.notes
+            , people_project_assignments.assignment_last_extracted
+            , people_project_assignments.assignment_last_updated
+            , project.cost_budget                                                       AS project_sow_value
+            , project.is_fixed_fee                                                      AS is_fixed_priced
+            , COALESCE(project.billable, false)                                         AS is_employee_billable
+            , project.is_billable                                                       AS is_project_billable
+            , project.archived                                                          AS is_project_archived
+    FROM        TOMW_DB.OVERWATCH_DEV_marts.dim_people_project_assignment    AS people_project_assignments
+    INNER JOIN  TOMW_DB.OVERWATCH_DEV_marts.dim_project                      AS project
+    ON project.forecast_project_id = people_project_assignments.forecast_project_id
+    INNER JOIN  TOMW_DB.OVERWATCH_DEV_marts.dim_people_calendar              AS people_calendar
+    ON people_calendar.forecast_people_id = people_project_assignments.forecast_people_id
+        -- AND people_calendar.date >= people_project_assignments.assignment_start_date
+        -- AND people_calendar.date <= people_project_assignments.assignment_end_date
+    --ORDER BY client_name, project_name, employee_name, assignment_date
+)
+
+SELECT harvest_billable_rate, * FROM FACT_FORECAST_ASSIGNMENTS_DAILY
+WHERE HARVEST_PROJECT_ID = 28063606
+AND assignment_month_num = 9;
+
+
+
+
+
+
+
+-- IS HERE
+WITH DIM_PEOPLE_PROJECT_ASSIGNMENT AS (
+    SELECT  harvest_project_employees.id                AS harvest_project_users_id
+            , forecast_assignments.person_id            AS forecast_people_id       
+            , forecast_people.harvest_user_id
+            , harvest_project_employees.project_id      AS harvest_project_id
+            , forecast_assignments.project_id           AS forecast_project_id
+            , harvest_project_employees.hourly_rate     AS harvest_billable_rate
+            , people_tags.region
+            , forecast_assignments.allocation
+            , forecast_assignments.start_date           AS assignment_start_date
+            , forecast_assignments.end_date             AS assignment_end_date
+            , harvest_project_employees.is_active       AS is_employee_active_on_project
+            , harvest_project_employees.is_project_manager
+            , harvest_users.is_admin
+            , forecast_assignments.notes
+            , forecast_assignments._sdc_extracted_at    AS assignment_last_extracted
+            , forecast_assignments.updated_at           AS assignment_last_updated   
+    FROM OVERWATCH_LANDING_DB.forecast.assignments                   AS forecast_assignments
+    LEFT JOIN OVERWATCH_LANDING_DB.forecast.projects                 AS forecast_projects
+    ON forecast_assignments.project_id = forecast_projects.id
+    LEFT JOIN OVERWATCH_LANDING_DB.forecast.people                   AS forecast_people
+    ON forecast_people.id = forecast_assignments.person_id
+    LEFT JOIN OVERWATCH_LANDING_DB.harvest.projects                  AS harvest_project
+    ON harvest_project.id = forecast_projects.harvest_id
+    LEFT JOIN OVERWATCH_LANDING_DB.harvest.project_users             AS harvest_project_employees
+    ON  harvest_project_employees.user_id = forecast_people.harvest_user_id
+        AND harvest_project_employees.project_id = harvest_project.id
+    LEFT JOIN OVERWATCH_LANDING_DB.harvest.users                     AS harvest_users --'is_admin' is only in the view 'harvest.users'
+    ON forecast_people.harvest_user_id = harvest_users.id
+    LEFT JOIN TOMW_DB.OVERWATCH_DEV_stg.people_tags                                                  AS people_tags   --region is only in 'dim_people_tags'
+    ON forecast_people.id = people_tags.id
+)
+
+SELECT * FROM DIM_PEOPLE_PROJECT_ASSIGNMENT
+WHERE HARVEST_PROJECT_ID = 28063606
+-- none for september
+
+
+SELECT * FROM OVERWATCH_LANDING_DB.forecast.assignments
+WHERE project_id = 28063606;
+
+
+
+SELECT * FROM
+"TOMW_DB"."OVERWATCH_DEV_REPORTING"."REP_CONSOLIDATED_REVENUE_WEEKLY_SNAPSHOT_CURRENT_WEEK"
+WHERE PROJECTCODE = 'DHP-21.012.API-TM-BRI'
+
+
+SELECT * FROM
+OVERWATCH_LANDING_DB.forecast.people
+WHERE FIRST_NAME LIKE 'David%'
+;
+
+SELECT * FROM
+OVERWATCH_LANDING_DB.forecast.people
+WHERE FIRST_NAME LIKE 'William%'
+;
+
+
+
+SELECT * FROM
+OVERWATCH_LANDING_DB.forecast.people
+WHERE HARVEST_USER_ID IS NULL
+AND ARCHIVED = TRUE
+AND EMAIL != NULL
+
+
+
+

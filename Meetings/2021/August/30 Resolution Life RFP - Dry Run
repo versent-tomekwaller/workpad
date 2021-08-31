@@ -1,0 +1,53 @@
+Questions for Them:
+    - Current solutions
+        - Data Sources
+        - Jobs
+        - Other integration tools
+        - Outputs?
+        - Current issues?
+        - Current general processes
+        - How to dyou approach current failures
+        - DR?
+        - 6000 Jobs
+    - Future questions
+        - Ask to compare informatica VS Talend?
+        - If we start, who created the jobs?
+
+
+Case Studies for me:
+    - Helping Pravin
+        - Snowflake issue blowing away permissions
+        - Snowflake SSO
+    - Helping Stan
+        - Needing assistance, despie being in different teams we are 
+            helping cross-team and making sure everyone is OK
+        -   
+    - Overwatch / Eagle
+        - Internal project performed by Professional Services being 
+            uplifted and reinforced by VMS
+        - Started off as support so we could understand the solution, 
+            but continued into a VMS build project
+        - Project provides a large amount of value to the business
+            but when handed over to VMS as logn term support, 
+            more stable and hands-off processes/changes put into palce
+        - Assistance from a Professional Services resource to
+            provide more code work
+        - Assistance with AWS 
+            As I am a data engineer, but AWS knowledge is good, but not airtight
+            Having other SME's allows me to ask them for help, as they do me
+        - Learninh new technologies for the business and providing this knowledge to the business
+            - Airflow
+            - DBT
+
+Culture
+    - slack
+    - open collaboration
+    - information sharing
+    - sharing the load
+    - Can learn most technologies as we understand the similarities to current tech
+        and can document the accentricies of each new solution for support/engineers
+
+
+
+
+

@@ -1,0 +1,16 @@
+HIDE BOOKMARKS BAR
+
+
+ResLife Informatica confluence page:  https://versent.atlassian.net/wiki/spaces/~268751231/pages/8269627396/ResLife+Informatica
+
+
+Airflow URL: https://0e834832-4b47-43c3-a8a8-2f91eb8ea319.c9.ap-southeast-2.airflow.amazonaws.com/tree?dag_id=Overwatch_ETL&root=
+
+Snowflake and SSO:
+    Confluence link:            https://versent.atlassian.net/wiki/spaces/VDF/pages/1350172755/SSO+and+Snowflake
+    Snowflake Incognito login:  https://versent.ap-southeast-2.snowflakecomputing.com/console/login#/
+    Snowflake from scratch:     https://versent.atlassian.net/wiki/spaces/VDF/pages/8265072756/How+to+build+Snowflake+from+Scratch
+
+DBT:
+    Docs:                       http://localhost:8080/#!/overview?g_v=1
+    
